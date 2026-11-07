@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4ecdf">
+  <meta name="description" content="Token Traffic is an interactive LLM serving simulator for prefill, decode, KV cache, batching, speculation and quantization.">
+  <title>Token Traffic - LLM Serving Simulator</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero" aria-labelledby="page-title">
+      <div class="hero-copy">
+        <p class="kicker">LLM serving, made visible</p>
+        <h1 id="page-title">Token Traffic</h1>
+        <p class="lede">Run a tiny inference engine. Watch prompts wait for prefill, tokens leave one by one, and scheduling choices change the queue.</p>
+      </div>
+      <div class="hero-actions" aria-label="Primary actions">
+        <button class="primary" id="runButton" type="button">Run the queue</button>
+        <button class="secondary" id="guideButton" type="button">Guided pass</button>
+      </div>
+    </section>
+
+    <section class="control-room" aria-label="Simulation controls and engine">
+      <div class="panel controls-panel">
+        <div class="section-heading">
+          <h2>Workload</h2>
+          <p id="statusText" role="status">Choose a shape, then run the queue.</p>
+        </div>
+
+        <div class="scenario-row" aria-label="Scenario presets">
+          <button type="button" data-scenario="balanced" data-active="true">Busy chat hour</button>
+          <button type="button" data-scenario="longBrief">Long prompt</button>
+          <button type="button" data-scenario="bursts">Short bursts</button>
+        </div>
+
+        <div class="slider-grid">
+          <label class="range-card" for="promptRange">
+            <span>Prompt length</span>
+            <strong id="promptValue">900 tokens</strong>
+            <input id="promptRange" type="range" min="64" max="8192" step="32" value="900">
+          </label>
+          <label class="range-card" for="outputRange">
+            <span>Answer length</span>
+            <strong id="outputValue">180 tokens</strong>
+            <input id="outputRange" type="range" min="16" max="1024" step="8" value="180">
+          </label>
+          <label class="range-card" for="requestRange">
+            <span>Concurrency</span>
+            <strong id="requestValue">16 requests</strong>
+            <input id="requestRange" type="range" min="1" max="48" step="1" value="16">
+          </label>
+        </div>
+
+        <div class="switch-grid" aria-label="Engine optimizations">
+          <label class="switch-card">
+            <input id="kvToggle" type="checkbox" checked>
+            <span class="switch"></span>
+            <span><strong>KV cache</strong><small>Reuse old keys and values</small></span>
+          </label>
+          <label class="switch-card">
+            <input id="continuousToggle" type="checkbox">
+            <span class="switch"></span>
+            <span><strong>Continuous batching</strong><small>Swap finished requests out</small></span>
+          </label>
+          <label class="switch-card">
+            <input id="chunkedToggle" type="checkbox">
+            <span class="switch"></span>
+            <span><strong>Chunked prefill</strong><small>Slice long prompts</small></span>
+          </label>
+          <label class="switch-card">
+            <input id="specToggle" type="checkbox">
+            <span class="switch"></span>
+            <span><strong>Speculative draft</strong><small>Verify several tokens together</small></span>
+          </label>
+          <label class="switch-card">
+            <input id="quantToggle" type="checkbox">
+            <span class="switch"></span>
+            <span><strong>8-bit weights</strong><small>Less memory, possible quality cost</small></span>
+          </label>
+          <label class="switch-card challenge-switch">
+            <input id="challengeToggle" type="checkbox">
+            <span class="switch"></span>
+            <span><strong>SLA challenge</strong><small>Can this mix clear the room?</small></span>
+          </label>
+        </div>
+      </div>
+
+      <div class="panel engine-panel" aria-label="Animated engine">
+        <div class="engine-topline">
+          <div>
+            <p class="kicker">Teaching GPU</p>
+            <h2 id="engineStatus">Waiting for work</h2>
+          </div>
+          <div class="clock" aria-label="Simulation clock"><span id="liveClock">0ms</span><small id="doneCount">0/16 complete</small></div>
+        </div>
+
+        <div class="engine-stage">
+          <div class="queue-column">
+            <span class="lane-label">Queue</span>
+            <div id="queueDots" class="dot-cloud" aria-label="Waiting requests"></div>
+          </div>
+          <div class="gpu-core">
+            <div class="lane prefill">
+              <span class="lane-label">Prefill</span>
+              <div id="prefillLane" class="lane-tokens"></div>
+            </div>
+            <div class="lane decode">
+              <span class="lane-label">Decode</span>
+              <div id="decodeLane" class="lane-tokens"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="memory-block">
+          <div class="memory-copy"><span>KV cache pressure</span><strong id="memoryLabel">13.5 GB live</strong></div>
+          <div class="memory-track" aria-hidden="true"><span id="memoryFill"></span></div>
+        </div>
+
+        <div id="requestStrip" class="request-strip" aria-label="All request states"></div>
+      </div>
+    </section>
+
+    <section class="metrics-grid" aria-label="Simulation results">
+      <article class="metric-card">
+        <span>Average TTFT</span>
+        <strong id="ttftMetric">-</strong>
+        <small>Arrival to first token</small>
+      </article>
+      <article class="metric-card">
+        <span>Throughput</span>
+        <strong id="throughputMetric">-</strong>
+        <small>Output tokens per second</small>
+      </article>
+      <article class="metric-card">
+        <span>Peak memory</span>
+        <strong id="memoryMetric">-</strong>
+        <small>Weights plus live KV cache</small>
+      </article>
+      <article class="metric-card">
+        <span>Total time</span>
+        <strong id="makespanMetric">-</strong>
+        <small>First arrival to final token</small>
+      </article>
+    </section>
+
+    <section id="challengeCard" class="challenge-card" hidden>
+      <div>
+        <p class="kicker">SLA challenge</p>
+        <h2>Clear the room without blowing the cache</h2>
+      </div>
+      <p id="challengeResult"></p>
+    </section>
+
+    <section class="insight-card" aria-live="polite">
+      <div>
+        <p class="kicker">What changed</p>
+        <h2 id="insightTitle">Start with the queue</h2>
+        <p id="insightText">Run it once, then flip one optimization. The comparison explains what changed without pretending this is hardware benchmarking.</p>
+      </div>
+      <button class="secondary" id="naiveButton" type="button">Compare naive engine</button>
+    </section>
+
+    <section id="guided" class="guided-card" aria-labelledby="guided-title">
+      <div class="guided-copy">
+        <p class="kicker">Guided pass</p>
+        <h2 id="guided-title">One idea at a time</h2>
+        <div class="step-shell">
+          <div class="step-topline"><strong id="stepTitle">1. Prefill writes the first cache</strong><span id="stepCount">1 / 6</span></div>
+          <p id="stepText">One prompt enters. The model reads the whole prompt, stores key and value states, then emits the first token.</p>
+          <div class="step-footer">
+            <div id="stepDots" class="step-dots" aria-hidden="true"></div>
+            <button class="primary small" id="nextStep" type="button">Next step</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="explain-grid" aria-label="Key ideas">
+      <article>
+        <h2>Prefill is parallel work</h2>
+        <p>The engine reads the prompt together and writes the first KV cache. Long prompts raise the wait before token one.</p>
+      </article>
+      <article>
+        <h2>Decode is sequential work</h2>
+        <p>Each new token depends on the last. Caching avoids recomputing old context, but generation still advances one step at a time.</p>
+      </article>
+      <article>
+        <h2>Serving is a scheduler problem</h2>
+        <p>Continuous batching fills empty seats. Chunked prefill keeps a long prompt from stopping every active decode.</p>
+      </article>
+    </section>
+
+    <section class="sources-card" aria-labelledby="sources-title">
+      <div>
+        <p class="kicker">Sources and limits</p>
+        <h2 id="sources-title">Grounded, but simplified</h2>
+        <ul id="assumptionList"></ul>
+      </div>
+      <nav aria-label="Technical sources">
+        <a href="https://huggingface.co/blog/continuous_batching">Hugging Face: Continuous batching from first principles</a>
+        <a href="https://huggingface.co/docs/transformers/kv_cache">Hugging Face: Cache strategies</a>
+        <a href="https://huggingface.co/docs/transformers/v5.5.4/assisted_decoding">Hugging Face: Assisted decoding</a>
+        <a href="https://docs.vllm.ai/en/stable/configuration/optimization/">vLLM: Optimization and tuning</a>
+        <a href="https://huggingface.co/docs/transformers/main/en/llm_optims">Hugging Face: Optimizing inference</a>
+      </nav>
+    </section>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
