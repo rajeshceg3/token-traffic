@@ -1,8 +1,8 @@
 const GB = 1_000_000_000;
 export const MODEL_BYTES_PER_TOKEN = 16_384; // Llama-2-7B example from the cited KV-cache derivation: 16 KB/token.
-export const WEIGHTS_GB = 13.5;
-export const QUANT_WEIGHTS_GB = 7.2;
-export const GPU_MEMORY_GB = 80;
+export const WEIGHTS_GB = 13.74; // Mistral-7B bf16 example from the cited inference guide.
+export const QUANT_WEIGHTS_GB = 6.87; // Same guide's 8-bit example.
+export const GPU_MEMORY_GB = 80; // Teaching budget, not a claim about the visitor's hardware.
 
 export const DEFAULT_CONFIG = Object.freeze({
   promptTokens: 900,
@@ -15,6 +15,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   quant8: false,
   challenge: false,
 });
+
+export const MODEL_ASSUMPTIONS = Object.freeze([
+  'All times and tokens/s are illustrative teaching units from a deterministic model, not measurements from a real GPU.',
+  'KV cache memory uses the cited 7B example of 16 KB per token; real cache size varies by layers, heads, precision and implementation.',
+  'Continuous batching and chunked prefill are scheduling and overlap techniques; this model explores one workload mix rather than promising a universal speedup.',
+  'Speculative decoding is modeled with workload-dependent draft acceptance; a weak draft or short answer can erase the gain.',
+  '8-bit weights lower modeled weight memory; speed and quality effects depend on the model, hardware and quantization method.',
+]);
 
 export const SCENARIOS = Object.freeze({
   balanced: {
@@ -80,14 +88,23 @@ function requestShape(i, config) {
 }
 
 function rateFactors(config) {
-  const quant = config.quant8 ? 1.16 : 1;
-  const spec = config.speculative ? 1.52 : 1;
+  // Quantization changes the modeled memory bill and can leave room for more seats.
+  // It is not treated as a universal speed knob because the cited guide notes
+  // that quantization can add dequantization latency on some hardware.
+  const spec = speculativeFactor(config);
   return {
-    prefillTokensPerMs: 1.55 * quant,
-    decodeTokensPerMsSingle: 0.052 * quant * spec,
-    decodeTokensPerMsAggregate: (config.continuousBatching ? 0.205 : 0.052) * quant * spec,
+    prefillTokensPerMs: 1.55,
+    decodeTokensPerMsSingle: 0.052 * spec,
+    decodeTokensPerMsAggregate: (config.continuousBatching ? 0.205 : 0.052) * spec,
     maxActive: config.continuousBatching ? (config.quant8 ? 12 : 9) : 1,
   };
+}
+
+function speculativeFactor(config) {
+  if (!config.speculative) return 1;
+  // The teaching model assumes a helpful draft only when there is enough output
+  // for accepted runs to amortize verification. Short answers can get slower.
+  return config.outputTokens >= 128 ? 1.28 : 0.94;
 }
 
 export function simulate(input = {}) {
@@ -237,12 +254,7 @@ export function simulate(input = {}) {
     })),
     metrics,
     snapshots: limitSnapshots(snapshots, 96),
-    assumptions: [
-      'Educational model, not a benchmark: rates are tuned to make scheduling tradeoffs visible.',
-      'KV cache estimate uses the 7B example of 16 KB per token; real models differ by layers, heads, precision and implementation.',
-      'Speculative decoding assumes a helpful draft and enough acceptance; bad drafts can make results worse.',
-      '8-bit weights reduce weight memory and often improve speed, with a possible quality tradeoff.',
-    ],
+    assumptions: [...MODEL_ASSUMPTIONS],
   };
 }
 
