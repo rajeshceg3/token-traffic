@@ -297,6 +297,12 @@ function renderNaiveComplete() {
     return;
   }
   const comparison = compareMetrics(naiveResult.metrics, optimizedResult.metrics);
+  if (Object.values(comparison).every((value) => Math.abs(value) < 0.05)) {
+    els.insightTitle.textContent = 'No relevant optimization enabled';
+    els.insightText.textContent = 'The current mix already matches the naive baseline. Turn on KV cache, continuous batching, chunked prefill, speculative draft, or 8-bit weights to isolate a change.';
+    els.deltaGrid.hidden = true;
+    return;
+  }
   renderDeltas(comparison);
   renderComparisonCopy(comparison);
 }
@@ -436,6 +442,7 @@ function weightMemoryGb(sourceConfig) {
 function naiveConfig(sourceConfig) {
   return normalizeConfig({
     ...sourceConfig,
+    kvCache: false,
     continuousBatching: false,
     chunkedPrefill: false,
     speculative: false,
