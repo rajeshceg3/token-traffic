@@ -1,4 +1,13 @@
-import { DEFAULT_CONFIG, SCENARIOS, compareConfigs, simulate } from './model.js';
+import {
+  DEFAULT_CONFIG,
+  GPU_MEMORY_GB,
+  MODEL_ASSUMPTIONS,
+  SCENARIOS,
+  WEIGHTS_GB,
+  normalizeConfig,
+  simulate,
+} from './model.js';
+import { APP_STATES, transitionState } from './statechart.js';
 
 const els = {
   promptRange: document.querySelector('#promptRange'),
@@ -15,7 +24,6 @@ const els = {
   challengeToggle: document.querySelector('#challengeToggle'),
   runButton: document.querySelector('#runButton'),
   guideButton: document.querySelector('#guideButton'),
-  naiveButton: document.querySelector('#naiveButton'),
   statusText: document.querySelector('#statusText'),
   insightTitle: document.querySelector('#insightTitle'),
   insightText: document.querySelector('#insightText'),
@@ -23,6 +31,7 @@ const els = {
   throughputMetric: document.querySelector('#throughputMetric'),
   memoryMetric: document.querySelector('#memoryMetric'),
   makespanMetric: document.querySelector('#makespanMetric'),
+  deltaGrid: document.querySelector('#deltaGrid'),
   queueDots: document.querySelector('#queueDots'),
   decodeLane: document.querySelector('#decodeLane'),
   prefillLane: document.querySelector('#prefillLane'),
@@ -46,38 +55,42 @@ const GUIDED_STEPS = [
   {
     title: '1. Prefill writes the first cache',
     text: 'One prompt enters. The model reads the whole prompt, stores key and value states, then emits the first token. That first wait is TTFT.',
-    config: { requests: 1, promptTokens: 900, outputTokens: 120, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false },
+    config: { requests: 1, promptTokens: 900, outputTokens: 120, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false, challenge: false },
   },
   {
     title: '2. Decode is one step at a time',
     text: 'The cache saves old work, but generation is still sequential: one token, append it, then the next. Turn the cache off later to feel why reuse matters.',
-    config: { requests: 1, promptTokens: 900, outputTokens: 260, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false },
+    config: { requests: 1, promptTokens: 900, outputTokens: 260, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false, challenge: false },
   },
   {
     title: '3. A queue changes the problem',
     text: 'With many requests, a naive engine lets one conversation own the GPU from prompt through final token. Everyone behind it waits.',
-    config: { requests: 18, promptTokens: 900, outputTokens: 180, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false },
+    config: { requests: 18, promptTokens: 900, outputTokens: 180, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false, challenge: false },
   },
   {
     title: '4. Continuous batching swaps finished work out',
     text: 'Finished requests leave immediately. Waiting requests fill the space, so the GPU spends fewer cycles idling between conversations.',
-    config: { requests: 18, promptTokens: 900, outputTokens: 180, kvCache: true, continuousBatching: true, chunkedPrefill: false, speculative: false, quant8: false },
+    config: { requests: 18, promptTokens: 900, outputTokens: 180, kvCache: true, continuousBatching: true, chunkedPrefill: false, speculative: false, quant8: false, challenge: false },
   },
   {
     title: '5. Chunked prefill stops the long prompt roadblock',
     text: 'A huge prompt no longer pauses every active decode. The engine takes one slice of prefill, lets decode progress, then takes another slice.',
-    config: { requests: 8, promptTokens: 3600, outputTokens: 220, kvCache: true, continuousBatching: true, chunkedPrefill: true, speculative: false, quant8: false },
+    config: { requests: 8, promptTokens: 3600, outputTokens: 220, kvCache: true, continuousBatching: true, chunkedPrefill: true, speculative: false, quant8: false, challenge: false },
   },
   {
     title: '6. Every win has a bill',
-    text: 'Speculation needs a useful draft. Quantization trades precision for memory and speed. More concurrency grows the KV cache. The right mix depends on the workload.',
+    text: 'Speculation needs a useful draft. Quantization trades precision for memory, and its speed depends on the stack. More concurrency grows the KV cache. The right mix depends on the workload.',
     config: { requests: 24, promptTokens: 1300, outputTokens: 240, kvCache: true, continuousBatching: true, chunkedPrefill: true, speculative: true, quant8: true, challenge: true },
   },
 ];
 
-let config = { ...DEFAULT_CONFIG };
-let result = simulate(config);
-let previousConfig = null;
+let config = normalizeConfig(DEFAULT_CONFIG);
+let appState = 'ready';
+let lastCompletedMode = 'optimized';
+let previewResult = simulate(config);
+let activeResult = null;
+let optimizedResult = null;
+let naiveResult = null;
 let playTimer = null;
 let snapshotIndex = 0;
 let guidedIndex = 0;
@@ -88,48 +101,51 @@ function init() {
   setControls(config);
   renderAssumptions();
   renderGuide();
-  renderResult({ autoplay: false });
+  resetRun('Ready. Run the current mix.');
 }
 
 function bindControls() {
   document.querySelectorAll('[data-scenario]').forEach((button) => {
     button.addEventListener('click', () => {
       const scenario = SCENARIOS[button.dataset.scenario];
-      config = { ...config, ...pickScenario(scenario) };
+      config = normalizeConfig({ ...config, ...pickScenario(scenario) });
       setControls(config);
-      runSimulation();
-      announceScenario(button, scenario.note);
+      markScenario(button);
+      resetRun(`Ready: ${scenario.label}. ${scenario.note}`);
     });
   });
 
   for (const el of [els.promptRange, els.outputRange, els.requestRange]) {
     el.addEventListener('input', () => {
-      config = readControls();
+      config = normalizeConfig(readControls());
       updateRangeLabels();
-      runSimulation({ quiet: true });
+      resetRun('Controls changed. Run the updated mix.');
     });
   }
 
   for (const el of [els.kvToggle, els.continuousToggle, els.chunkedToggle, els.specToggle, els.quantToggle]) {
     el.addEventListener('change', () => {
-      config = readControls();
-      runSimulation();
+      config = normalizeConfig(readControls());
+      resetRun('Engine mix changed. Run it to see the effect.');
     });
   }
 
   els.challengeToggle.addEventListener('change', () => {
-    config = readControls();
-    els.challengeCard.hidden = !config.challenge;
-    runSimulation();
+    config = normalizeConfig(readControls());
+    resetRun(config.challenge ? 'Challenge on. Run the mix to check the goal.' : 'Challenge off. Run the current mix.');
   });
 
-  els.runButton.addEventListener('click', () => runSimulation({ autoplay: true }));
+  els.runButton.addEventListener('click', () => {
+    if (!APP_STATES[appState].canRun) return;
+    const nextMode = appState === 'complete' && lastCompletedMode === 'optimized' ? 'naive' : 'optimized';
+    startRun(nextMode);
+  });
+
   els.guideButton.addEventListener('click', () => {
     document.querySelector('#guided').scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'start' });
     applyGuidedStep(0);
   });
   els.nextStep.addEventListener('click', () => applyGuidedStep((guidedIndex + 1) % GUIDED_STEPS.length));
-  els.naiveButton.addEventListener('click', showNaiveComparison);
 }
 
 function pickScenario(scenario) {
@@ -174,122 +190,256 @@ function updateRangeLabels() {
   els.requestValue.textContent = `${els.requestRange.value} requests`;
 }
 
-function runSimulation(options = {}) {
+function resetRun(message) {
   stopPlayback();
-  previousConfig = previousConfig || { ...config, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false };
-  result = simulate(config);
-  renderResult(options);
+  appState = transitionState(appState, 'RESET');
+  lastCompletedMode = 'optimized';
+  previewResult = simulate(config);
+  activeResult = null;
+  optimizedResult = null;
+  naiveResult = null;
+  renderReady(message);
 }
 
-function renderResult({ autoplay = true, quiet = false } = {}) {
-  renderMetrics(result.metrics);
-  renderInsight(previousConfig, config);
+function renderReady(message) {
+  const requestCount = previewResult.metrics.requested;
+  els.statusText.textContent = message;
+  els.engineStatus.textContent = 'Ready';
+  els.liveClock.textContent = '0ms';
+  els.doneCount.textContent = `0/${requestCount} complete`;
+  els.memoryLabel.textContent = `${weightMemoryGb(config).toFixed(1)} GB weights`;
+  setMemoryFill(weightMemoryGb(config));
+  els.queueDots.replaceChildren(...previewResult.requests.slice(0, 14).map((request) => tokenDot(request.id)));
+  els.prefillLane.replaceChildren(emptyNote('idle'));
+  els.decodeLane.replaceChildren(emptyNote('idle'));
+  renderStrip(previewResult, null);
+  renderMetrics(null);
+  renderJourneyReady();
+  els.challengeCard.hidden = !config.challenge;
+  els.challengeResult.textContent = '';
+  els.runButton.disabled = false;
+  els.runButton.textContent = 'Run the queue';
+}
+
+function startRun(mode) {
+  appState = transitionState(appState, 'RUN');
+  const runConfig = mode === 'naive' ? naiveConfig(config) : config;
+  activeResult = simulate(runConfig);
+  renderRunning(mode);
+  if (reducedMotion) {
+    renderSnapshot(activeResult.snapshots[activeResult.snapshots.length - 1]);
+    finishRun(mode);
+    return;
+  }
+  startPlayback(mode);
+}
+
+function renderRunning(mode) {
+  els.statusText.textContent = mode === 'naive' ? 'Running the naive baseline...' : 'Running the current mix...';
+  els.engineStatus.textContent = 'Starting';
+  els.liveClock.textContent = '0ms';
+  els.doneCount.textContent = `0/${activeResult.metrics.requested} complete`;
+  els.runButton.disabled = true;
+  els.runButton.textContent = 'Running...';
+  els.deltaGrid.hidden = true;
+  renderMetrics(null);
+  renderStrip(activeResult, null);
+  renderSnapshot(activeResult.snapshots[0]);
+}
+
+function startPlayback(mode) {
+  stopPlayback();
+  snapshotIndex = 0;
+  const delay = Math.max(35, Math.min(160, activeResult.metrics.makespanMs / Math.max(1, activeResult.snapshots.length) / 12));
+  playTimer = window.setInterval(() => {
+    snapshotIndex += 1;
+    if (snapshotIndex >= activeResult.snapshots.length) {
+      stopPlayback();
+      finishRun(mode);
+      return;
+    }
+    renderSnapshot(activeResult.snapshots[snapshotIndex]);
+  }, delay);
+}
+
+function finishRun(mode) {
+  if (appState !== 'complete') appState = transitionState(appState, 'FINISH');
+  lastCompletedMode = mode;
+  const finalSnapshot = activeResult.snapshots[activeResult.snapshots.length - 1];
+  renderSnapshot(finalSnapshot, { complete: true });
+  renderMetrics(activeResult.metrics);
+  renderStrip(activeResult, finalSnapshot);
+  if (mode === 'optimized') {
+    optimizedResult = activeResult;
+    naiveResult = null;
+    renderOptimizedComplete();
+  } else {
+    naiveResult = activeResult;
+    renderNaiveComplete();
+  }
   renderChallenge();
-  renderStrip();
-  renderSnapshot(result.snapshots[0]);
-  if (autoplay && !reducedMotion && !quiet) startPlayback();
-  if (quiet) els.statusText.textContent = 'Controls update the simulation immediately.';
-  else els.statusText.textContent = result.metrics.timedOut ? 'The educational run timed out before every request finished.' : 'Simulation complete. Replay the queue or change a switch.';
+  els.runButton.disabled = false;
+  els.runButton.textContent = mode === 'optimized' ? 'Run naive baseline' : 'Replay optimized mix';
+}
+
+function renderOptimizedComplete() {
+  els.statusText.textContent = 'Current mix complete. Next: run the naive baseline.';
+  els.insightTitle.textContent = 'Current mix complete';
+  els.insightText.textContent = 'These are illustrative model estimates for this workload. Run the naive baseline next to isolate what the scheduler and optimizations changed.';
+  els.deltaGrid.hidden = true;
+}
+
+function renderNaiveComplete() {
+  els.statusText.textContent = 'Naive baseline complete. Compare the deltas.';
+  if (!optimizedResult) {
+    els.insightTitle.textContent = 'Naive baseline complete';
+    els.insightText.textContent = 'Run the current mix to compare it with this baseline.';
+    return;
+  }
+  const comparison = compareMetrics(naiveResult.metrics, optimizedResult.metrics);
+  renderDeltas(comparison);
+  renderComparisonCopy(comparison);
+}
+
+function compareMetrics(naive, optimized) {
+  return {
+    ttft: pctDelta(naive.avgTtftMs, optimized.avgTtftMs),
+    throughput: pctDelta(naive.throughputTokS, optimized.throughputTokS),
+    memory: pctDelta(naive.peakMemoryGb, optimized.peakMemoryGb),
+    makespan: pctDelta(naive.makespanMs, optimized.makespanMs),
+  };
+}
+
+function pctDelta(before, after) {
+  if (!before) return 0;
+  return Math.round(((after - before) / before) * 1000) / 10;
+}
+
+function renderDeltas(comparison) {
+  const rows = [
+    { label: 'Average TTFT', value: comparison.ttft, good: comparison.ttft < 0, hint: 'lower is better' },
+    { label: 'Throughput', value: comparison.throughput, good: comparison.throughput > 0, hint: 'higher is better' },
+    { label: 'Peak memory', value: comparison.memory, good: comparison.memory < 0, hint: 'lower is better' },
+    { label: 'Total time', value: comparison.makespan, good: comparison.makespan < 0, hint: 'lower is better' },
+  ];
+  els.deltaGrid.replaceChildren(...rows.map((row) => {
+    const card = document.createElement('div');
+    card.className = 'delta-card';
+    card.dataset.good = String(row.good);
+    const value = document.createElement('strong');
+    value.textContent = `${row.value > 0 ? '+' : ''}${row.value}%`;
+    const label = document.createElement('span');
+    label.textContent = row.label;
+    const hint = document.createElement('small');
+    hint.textContent = row.hint;
+    card.append(label, value, hint);
+    return card;
+  }));
+  els.deltaGrid.hidden = false;
+}
+
+function renderComparisonCopy(comparison) {
+  if (comparison.ttft <= -15) {
+    els.insightTitle.textContent = 'First tokens move sooner in this workload';
+    els.insightText.textContent = 'The modeled queue wait fell. Continuous batching and chunked prefill can reduce blocking here, but the size of the effect depends on the real model, hardware and traffic.';
+  } else if (comparison.throughput >= 20) {
+    els.insightTitle.textContent = 'Throughput moved first';
+    els.insightText.textContent = 'Finished requests leave the modeled engine sooner, making room for waiting work. This is a scheduling effect in one workload, not a universal speedup.';
+  } else if (comparison.memory <= -10) {
+    els.insightTitle.textContent = 'The memory bill is lower';
+    els.insightText.textContent = 'The 8-bit setting lowers modeled weight memory. Speed and quality still depend on the model, hardware and quantization method.';
+  } else {
+    els.insightTitle.textContent = 'A small trade, not magic';
+    els.insightText.textContent = 'This mix changes the balance between queue wait, token speed and cache pressure. Try one switch at a time and watch which metric moves.';
+  }
 }
 
 function renderMetrics(metrics) {
+  if (!metrics) {
+    els.ttftMetric.textContent = '—';
+    els.throughputMetric.textContent = '—';
+    els.memoryMetric.textContent = '—';
+    els.makespanMetric.textContent = '—';
+    return;
+  }
   els.ttftMetric.textContent = formatMs(metrics.avgTtftMs);
   els.throughputMetric.textContent = `${metrics.throughputTokS.toLocaleString()} tok/s`;
   els.memoryMetric.textContent = `${metrics.peakMemoryGb.toFixed(1)} GB`;
   els.makespanMetric.textContent = formatMs(metrics.makespanMs);
-  els.memoryFill.style.width = `${Math.min(100, metrics.cachePressurePct)}%`;
-  els.memoryFill.dataset.hot = metrics.cachePressurePct > 82 ? 'true' : 'false';
-  els.memoryLabel.textContent = `${metrics.cachePressurePct}% of the teaching GPU`;
 }
 
-function renderInsight(beforeConfig, afterConfig) {
-  if (!beforeConfig) {
-    els.insightTitle.textContent = 'Start with the queue';
-    els.insightText.textContent = 'Run it once, then flip one optimization. The comparison explains what changed without pretending this is hardware benchmarking.';
-    return;
-  }
-  const comparison = compareConfigs(beforeConfig, afterConfig);
-  if (!afterConfig.kvCache) {
-    els.insightTitle.textContent = 'The cache bill came due';
-    els.insightText.textContent = 'Decode slowed because each new token revisits old work. The memory gauge looks lighter, but the request queue pays for it.';
-  } else if (comparison.throughputDeltaPct >= 20) {
-    els.insightTitle.textContent = 'Throughput moved first';
-    els.insightText.textContent = `Throughput rose ${Math.abs(comparison.throughputDeltaPct)}%. Finished work is leaving the engine instead of holding a seat.`;
-  } else if (comparison.ttftDeltaPct <= -15) {
-    els.insightTitle.textContent = 'First tokens arrive sooner';
-    els.insightText.textContent = `Average TTFT fell ${Math.abs(comparison.ttftDeltaPct)}%. Long prompts are no longer blocking the whole room.`;
-  } else if (comparison.memoryDeltaPct <= -10) {
-    els.insightTitle.textContent = 'Memory pressure dropped';
-    els.insightText.textContent = `Peak memory fell ${Math.abs(comparison.memoryDeltaPct)}%. That opens room for more concurrent requests, with a quality tradeoff to check.`;
-  } else if (afterConfig.speculative) {
-    els.insightTitle.textContent = 'Speculation helps when the draft is right';
-    els.insightText.textContent = 'The helper proposes tokens and the main model verifies them. A poor assistant or low acceptance can erase the gain.';
-  } else {
-    els.insightTitle.textContent = 'A small trade, not magic';
-    els.insightText.textContent = 'This mix changes the balance between queue wait, token speed and cache pressure. Watch which metric moved before calling it better.';
-  }
-  previousConfig = { ...afterConfig };
+function renderJourneyReady() {
+  els.insightTitle.textContent = 'Ready when you are';
+  els.insightText.textContent = 'Run the current mix first. Then run the naive baseline against the same workload to see what changed. Times are illustrative, not measured GPU benchmarks.';
+  els.deltaGrid.hidden = true;
 }
 
 function renderChallenge() {
-  if (!config.challenge) return;
-  const m = result.metrics;
+  if (!config.challenge || !activeResult) return;
+  const m = activeResult.metrics;
   const pass = m.avgTtftMs <= 1800 && m.throughputTokS >= 55 && m.peakMemoryGb <= 72;
   els.challengeResult.dataset.pass = String(pass);
   els.challengeResult.innerHTML = pass
-    ? '<strong>SLA met.</strong> First tokens stay quick, throughput clears the room, and the cache still fits.'
+    ? '<strong>SLA met.</strong> First tokens stay quick, throughput clears the room, and the cache still fits in this model.'
     : '<strong>SLA missed.</strong> Try continuous batching for queue wait, chunked prefill for long prompts, then decide whether speculation or quantization is worth its tradeoff.';
 }
 
-function renderStrip() {
+function renderStrip(result, snapshot) {
   const frag = document.createDocumentFragment();
   result.requests.forEach((request) => {
     const chip = document.createElement('span');
     chip.className = 'request-chip';
     chip.textContent = request.id;
     chip.title = `Request ${request.id}: ${request.promptTokens} prompt tokens, ${request.outputTokens} output tokens`;
+    if (!snapshot) chip.dataset.state = 'queued';
     frag.append(chip);
   });
   els.requestStrip.replaceChildren(frag);
+  if (snapshot) paintStrip(snapshot);
 }
 
-function startPlayback() {
-  stopPlayback();
-  snapshotIndex = 0;
-  const delay = Math.max(35, Math.min(160, result.metrics.makespanMs / Math.max(1, result.snapshots.length) / 12));
-  playTimer = window.setInterval(() => {
-    snapshotIndex += 1;
-    if (snapshotIndex >= result.snapshots.length) {
-      stopPlayback();
-      els.statusText.textContent = 'Every request finished. Change one switch and compare.';
-      return;
-    }
-    renderSnapshot(result.snapshots[snapshotIndex]);
-  }, delay);
-}
-
-function stopPlayback() {
-  if (playTimer) window.clearInterval(playTimer);
-  playTimer = null;
-}
-
-function renderSnapshot(snapshot) {
-  if (!snapshot) return;
-  els.liveClock.textContent = formatMs(snapshot.ms);
-  els.doneCount.textContent = `${snapshot.doneCount}/${result.metrics.requested} complete`;
-  els.engineStatus.textContent = snapshot.prefillingId
-    ? `Prefill ${snapshot.prefillingId}${snapshot.decodingIds.length ? ` + decode ${snapshot.decodingIds.join(', ')}` : ''}`
-    : snapshot.decodingIds.length
-      ? `Decode ${snapshot.decodingIds.join(', ')}`
-      : 'Waiting for work';
-  els.memoryLabel.textContent = `${snapshot.memoryGb.toFixed(1)} GB live`;
-  els.memoryFill.style.width = `${Math.min(100, (snapshot.memoryGb / 80) * 100)}%`;
-  els.queueDots.replaceChildren(...snapshot.queuedIds.slice(0, 14).map(tokenDot));
-  els.prefillLane.replaceChildren(...(snapshot.prefillingId ? [tokenDot(snapshot.prefillingId, 'hot')] : [emptyNote('idle')]));
-  els.decodeLane.replaceChildren(...(snapshot.decodingIds.length ? snapshot.decodingIds.slice(0, 12).map((id) => tokenDot(id, 'cool')) : [emptyNote('idle')]));
+function paintStrip(snapshot) {
   document.querySelectorAll('.request-chip').forEach((chip) => {
     const id = Number(chip.textContent);
     chip.dataset.state = snapshot.doneCount >= id ? 'done' : snapshot.decodingIds.includes(id) ? 'decoding' : snapshot.prefillingId === id ? 'prefilling' : snapshot.queuedIds.includes(id) ? 'queued' : 'arriving';
+  });
+}
+
+function renderSnapshot(snapshot, { complete = false } = {}) {
+  if (!snapshot || !activeResult) return;
+  els.liveClock.textContent = formatMs(snapshot.ms);
+  els.doneCount.textContent = `${snapshot.doneCount}/${activeResult.metrics.requested} complete`;
+  els.engineStatus.textContent = complete
+    ? 'Complete'
+    : snapshot.prefillingId
+      ? `Prefill ${snapshot.prefillingId}${snapshot.decodingIds.length ? ` + decode ${snapshot.decodingIds.join(', ')}` : ''}`
+      : snapshot.decodingIds.length
+        ? `Decode ${snapshot.decodingIds.join(', ')}`
+        : 'Waiting for work';
+  els.memoryLabel.textContent = `${snapshot.memoryGb.toFixed(1)} GB live`;
+  setMemoryFill(snapshot.memoryGb);
+  els.queueDots.replaceChildren(...snapshot.queuedIds.slice(0, 14).map(tokenDot));
+  els.prefillLane.replaceChildren(...(snapshot.prefillingId ? [tokenDot(snapshot.prefillingId, 'hot')] : [emptyNote('idle')]));
+  els.decodeLane.replaceChildren(...(snapshot.decodingIds.length ? snapshot.decodingIds.slice(0, 12).map((id) => tokenDot(id, 'cool')) : [emptyNote('idle')]));
+  paintStrip(snapshot);
+}
+
+function setMemoryFill(memoryGb) {
+  els.memoryFill.style.width = `${Math.min(100, (memoryGb / GPU_MEMORY_GB) * 100)}%`;
+  els.memoryFill.dataset.hot = memoryGb / GPU_MEMORY_GB > 0.82 ? 'true' : 'false';
+}
+
+function weightMemoryGb(sourceConfig) {
+  return sourceConfig.quant8 ? 6.87 : WEIGHTS_GB;
+}
+
+function naiveConfig(sourceConfig) {
+  return normalizeConfig({
+    ...sourceConfig,
+    continuousBatching: false,
+    chunkedPrefill: false,
+    speculative: false,
+    quant8: false,
   });
 }
 
@@ -307,19 +457,12 @@ function emptyNote(text) {
   return note;
 }
 
-function showNaiveComparison() {
-  const naive = { ...config, kvCache: true, continuousBatching: false, chunkedPrefill: false, speculative: false, quant8: false };
-  const comparison = compareConfigs(naive, config);
-  els.insightTitle.textContent = 'Against the naive engine';
-  els.insightText.textContent = `This setup changes TTFT by ${comparison.ttftDeltaPct}%, throughput by ${comparison.throughputDeltaPct}%, total time by ${comparison.makespanDeltaPct}% and memory by ${comparison.memoryDeltaPct}%. Negative time is better; positive throughput is better.`;
-}
-
 function applyGuidedStep(index) {
   guidedIndex = index;
-  config = { ...config, ...GUIDED_STEPS[index].config };
+  config = normalizeConfig({ ...config, ...GUIDED_STEPS[index].config });
   setControls(config);
   renderGuide();
-  runSimulation({ autoplay: true });
+  resetRun(`Guided step ${index + 1} ready. Run the queue when you are.`);
 }
 
 function renderGuide() {
@@ -335,16 +478,24 @@ function renderGuide() {
 }
 
 function renderAssumptions() {
-  els.assumptionList.replaceChildren(...result.assumptions.map((text) => {
+  els.assumptionList.replaceChildren(...MODEL_ASSUMPTIONS.map((text) => {
     const li = document.createElement('li');
     li.textContent = text;
     return li;
   }));
 }
 
-function announceScenario(button, note) {
-  document.querySelectorAll('[data-scenario]').forEach((el) => el.dataset.active = String(el === button));
-  els.statusText.textContent = note;
+function markScenario(activeButton) {
+  document.querySelectorAll('[data-scenario]').forEach((el) => {
+    const active = el === activeButton;
+    el.dataset.active = String(active);
+    el.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function stopPlayback() {
+  if (playTimer) window.clearInterval(playTimer);
+  playTimer = null;
 }
 
 function formatMs(ms) {
