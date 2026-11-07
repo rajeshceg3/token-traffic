@@ -105,6 +105,10 @@ function init() {
 }
 
 function bindControls() {
+  document.querySelector('#baselineButton').addEventListener('click', () => {
+    resetRun('Starting with the naive baseline.');
+    startRun('naive');
+  });
   document.querySelectorAll('[data-scenario]').forEach((button) => {
     button.addEventListener('click', () => {
       const scenario = SCENARIOS[button.dataset.scenario];
@@ -209,7 +213,7 @@ function renderReady(message) {
   els.doneCount.textContent = `0/${requestCount} complete`;
   els.memoryLabel.textContent = `${weightMemoryGb(config).toFixed(1)} GB weights`;
   setMemoryFill(weightMemoryGb(config));
-  els.queueDots.replaceChildren(...previewResult.requests.slice(0, 14).map((request) => tokenDot(request.id)));
+  els.queueDots.replaceChildren(...previewResult.requests.map((request) => tokenDot(request.id)));
   els.prefillLane.replaceChildren(emptyNote('idle'));
   els.decodeLane.replaceChildren(emptyNote('idle'));
   renderStrip(previewResult, null);
@@ -271,7 +275,6 @@ function finishRun(mode) {
   renderStrip(activeResult, finalSnapshot);
   if (mode === 'optimized') {
     optimizedResult = activeResult;
-    naiveResult = null;
     renderOptimizedComplete();
   } else {
     naiveResult = activeResult;
@@ -283,6 +286,7 @@ function finishRun(mode) {
 }
 
 function renderOptimizedComplete() {
+  if (naiveResult) { renderNaiveComplete(); return; }
   els.statusText.textContent = 'Current mix complete. Next: run the naive baseline.';
   els.insightTitle.textContent = 'Current mix complete';
   els.insightText.textContent = 'These are illustrative model estimates for this workload. Run the naive baseline next to isolate what the scheduler and optimizations changed.';
@@ -290,8 +294,8 @@ function renderOptimizedComplete() {
 }
 
 function renderNaiveComplete() {
-  els.statusText.textContent = 'Naive baseline complete. Compare the deltas.';
-  if (!optimizedResult) {
+  els.statusText.textContent = lastCompletedMode === 'naive' ? 'Naive baseline complete. Compare both runs.' : 'Optimized mix complete. Compare both runs.';
+  if (!optimizedResult || !naiveResult) {
     els.insightTitle.textContent = 'Naive baseline complete';
     els.insightText.textContent = 'Run the current mix to compare it with this baseline.';
     return;
@@ -337,16 +341,24 @@ function renderDeltas(comparison) {
     const label = document.createElement('span');
     label.textContent = row.label;
     const hint = document.createElement('small');
-    hint.textContent = row.hint;
+    const keys = ['avgTtftMs', 'throughputTokS', 'peakMemoryGb', 'makespanMs'];
+    const key = keys[rows.indexOf(row)];
+    const format = (value) => key === 'peakMemoryGb' ? `${value.toFixed(1)} GB` : key === 'throughputTokS' ? `${value} tok/s` : formatMs(value);
+    hint.textContent = `Naive ${format(naiveResult.metrics[key])} → optimized ${format(optimizedResult.metrics[key])}. ${row.hint}.`;
     card.append(label, value, hint);
     return card;
   }));
   els.deltaGrid.hidden = false;
+  const caption = document.createElement('p');
+  caption.style.gridColumn = '1 / -1';
+  caption.style.margin = '0';
+  caption.textContent = 'Optimized vs naive · same workload · model estimates. Change = (optimized − naive) / naive.';
+  els.deltaGrid.prepend(caption);
 }
 
 function renderComparisonCopy(comparison) {
   if (comparison.ttft <= -15) {
-    els.insightTitle.textContent = 'First tokens move sooner in this workload';
+    els.insightTitle.textContent = 'Optimized mix: first tokens arrive sooner';
     els.insightText.textContent = 'The modeled queue wait fell. Continuous batching and chunked prefill can reduce blocking here, but the size of the effect depends on the real model, hardware and traffic.';
   } else if (comparison.throughput >= 20) {
     els.insightTitle.textContent = 'Throughput moved first';
@@ -361,6 +373,14 @@ function renderComparisonCopy(comparison) {
 }
 
 function renderMetrics(metrics) {
+  let label = document.querySelector('#metricsLabel');
+  if (!label) {
+    label = document.createElement('h3');
+    label.id = 'metricsLabel';
+    label.style.margin = '0 0 12px';
+    document.querySelector('.metrics-grid').before(label);
+  }
+  label.textContent = metrics ? `${lastCompletedMode === 'naive' ? 'Naive baseline' : 'Optimized mix'} · model estimates` : 'Model estimates';
   if (!metrics) {
     els.ttftMetric.textContent = '—';
     els.throughputMetric.textContent = '—';
@@ -424,7 +444,7 @@ function renderSnapshot(snapshot, { complete = false } = {}) {
         : 'Waiting for work';
   els.memoryLabel.textContent = `${snapshot.memoryGb.toFixed(1)} GB live`;
   setMemoryFill(snapshot.memoryGb);
-  els.queueDots.replaceChildren(...snapshot.queuedIds.slice(0, 14).map(tokenDot));
+  els.queueDots.replaceChildren(...snapshot.queuedIds.map(tokenDot));
   els.prefillLane.replaceChildren(...(snapshot.prefillingId ? [tokenDot(snapshot.prefillingId, 'hot')] : [emptyNote('idle')]));
   els.decodeLane.replaceChildren(...(snapshot.decodingIds.length ? snapshot.decodingIds.slice(0, 12).map((id) => tokenDot(id, 'cool')) : [emptyNote('idle')]));
   paintStrip(snapshot);
