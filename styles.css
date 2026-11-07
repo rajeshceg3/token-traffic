@@ -548,7 +548,7 @@ h2 {
   .metric-card { padding: 13px; }
   .metric-card strong { font-size: 1.65rem; }
   .scenario-row { grid-template-columns: 1fr; border-radius: 22px; }
-  .switch-grid { grid-template-columns: 1fr; }
+  .switch-grid, .explain-grid { grid-template-columns: 1fr; }
   .step-footer { align-items: stretch; flex-direction: column; }
   .step-footer .primary { width: 100%; }
 }
