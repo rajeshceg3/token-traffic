@@ -22,7 +22,7 @@ function check(name, fn) {
   }
 }
 
-const base = { ...DEFAULT_CONFIG, requests: 18, promptTokens: 1200, outputTokens: 220 };
+const base = { ...DEFAULT_CONFIG, continuousBatching: false, chunkedPrefill: false, requests: 18, promptTokens: 1200, outputTokens: 220 };
 
 check('simulation finishes all requests', () => {
   const result = simulate(base);
@@ -100,6 +100,21 @@ check('comparison metrics have expected direction', () => {
   const comparison = compareConfigs(base, { ...base, continuousBatching: true, chunkedPrefill: true });
   assert.ok(comparison.throughputDeltaPct > 0);
   assert.ok(comparison.makespanDeltaPct < 0);
+});
+
+check('default optimized journey has meaningful naive deltas', () => {
+  const naive = simulate({
+    ...DEFAULT_CONFIG,
+    kvCache: false,
+    continuousBatching: false,
+    chunkedPrefill: false,
+    speculative: false,
+    quant8: false,
+  }).metrics;
+  const optimized = simulate(DEFAULT_CONFIG).metrics;
+  assert.ok(optimized.throughputTokS > naive.throughputTokS);
+  assert.ok(optimized.makespanMs < naive.makespanMs);
+  assert.ok(optimized.avgTtftMs < naive.avgTtftMs);
 });
 
 check('no NaN leaks into metrics or snapshots', () => {
